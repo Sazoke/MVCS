@@ -1,7 +1,9 @@
 ﻿using System.Reflection;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Microsoft.EntityFrameworkCore.Metadata;
 using MVCS.Base.Attributes;
 using MVCS.Base.Models;
 using Version = MVCS.Base.Models.Version;
@@ -10,6 +12,8 @@ namespace MVCS.Base.Common.Extensions;
 
 internal static  class SaveChangesOverridingExtensions
 {
+    private static JsonSerializerOptions _options = new()
+        { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
     public static void CommitChanges(this MVCSDbContext context)
     { 
         var entries = context.ChangeTracker.Entries()
@@ -38,17 +42,17 @@ internal static  class SaveChangesOverridingExtensions
 
     private static Version GetAddedVersion(EntityEntry entityEntry)
     {
-        var id = GetEntryId(entityEntry);
+        var id = GetEntryId(entityEntry.Metadata, entityEntry.Entity);
         var version = new Version()
         {
             ObjectId = id,
             ChangeType = entityEntry.State,
             Changes = GetCheckedProperties(entityEntry)
-                .Where(p => p.CurrentValue != null)
+                .Where(p => p.JsonValue is not null)
                 .Select(p => new Change
                 {
-                    PropertyName = p.Metadata.Name,
-                    Value = JsonSerializer.Serialize(p.CurrentValue)
+                    PropertyName = p.Name,
+                    Value = p.JsonValue
                 }).ToList()
         };
 
@@ -57,7 +61,7 @@ internal static  class SaveChangesOverridingExtensions
     
     private static Version GetDeletedVersion(MVCSDbContext context, EntityEntry entityEntry)
     {
-        var id = GetEntryId(entityEntry);
+        var id = GetEntryId(entityEntry.Metadata, entityEntry.Entity);
         var previousVersion = context.Versions.First(v => v.IsActual && v.ObjectId == id);
         previousVersion.IsActual = false;
         var version = new Version()
@@ -72,7 +76,7 @@ internal static  class SaveChangesOverridingExtensions
 
     private static Version GetModifiedVersion(MVCSDbContext context, EntityEntry entityEntry)
     {
-        var id = GetEntryId(entityEntry);
+        var id = GetEntryId(entityEntry.Metadata, entityEntry.Entity);
         var versions = context.Versions.Where(v => v.ObjectId == id).ToArray();
         var previousVersion = versions.First(v => v.IsActual);
         previousVersion.IsActual = false;
@@ -82,13 +86,12 @@ internal static  class SaveChangesOverridingExtensions
             ObjectId = id,
             ChangeType = entityEntry.State,
             Changes = GetCheckedProperties(entityEntry)
-                .Select(p => (p, JsonSerializer.Serialize(p.CurrentValue)))
-                .Where(p => props.ContainsKey(p.p.Metadata.Name) && p.Item2 != props[p.p.Metadata.Name] ||
-                            !props.ContainsKey(p.p.Metadata.Name) && p.p.CurrentValue is not null)
+                .Where(p => props.ContainsKey(p.Name) && p.JsonValue != props[p.Name] ||
+                            !props.ContainsKey(p.Name) && p.JsonValue is not null)
                 .Select(p => new Change
                 {
-                    PropertyName = p.p.Metadata.Name,
-                    Value = p.Item2
+                    PropertyName = p.Name,
+                    Value = p.JsonValue
                 }).ToList(),
             PreviousVersion = previousVersion
         };
@@ -111,17 +114,34 @@ internal static  class SaveChangesOverridingExtensions
         return result;
     }
 
-    private static string GetEntryId(EntityEntry entityEntry) => string.Join('_',
-        entityEntry.Properties.Where(p => p.Metadata.IsPrimaryKey())
-            .Select(p => p.CurrentValue?.ToString()));
+    private static string GetEntryId(IEntityType entityType, object entity) => string.Join('_',
+        entityType.FindPrimaryKey()!.Properties
+            .Select(p => p.PropertyInfo!.GetValue(entity)!.ToString()));
 
-    private static IEnumerable<PropertyEntry> GetCheckedProperties(EntityEntry entry)
+    private static IEnumerable<(string Name, string? JsonValue)> GetCheckedProperties(EntityEntry entry)
     {
         var versionAttribute = typeof(VersionControlAttribute);
         var query = entry.Properties;
         if (entry.Metadata.ClrType.GetCustomAttribute(versionAttribute) is null)
-            return query.Where(p => p.Metadata.ClrType.GetCustomAttribute(versionAttribute) is not null);
-        var ignoreAttribute = typeof(IgnoreVersionControlAttribute);
-        return query.Where(p => p.Metadata.PropertyInfo?.GetCustomAttribute(ignoreAttribute) is null);
+            query = query.Where(p => p.Metadata.ClrType.GetCustomAttribute(versionAttribute) is not null);
+        else
+        {
+            var ignoreAttribute = typeof(IgnoreVersionControlAttribute);
+            query = query.Where(p => p.Metadata.PropertyInfo?.GetCustomAttribute(ignoreAttribute) is null);
+        }
+
+        var resultQuery =
+            query.Select(q =>
+                (q.Metadata.Name, q.CurrentValue is null ? null : JsonSerializer.Serialize(q.CurrentValue, _options)));
+        resultQuery = resultQuery!.Concat(entry.Collections.Select(c =>
+        {
+            var name = c.Metadata.Name;
+            var result = new List<string>();
+            if (c.CurrentValue is null) return (name, JsonSerializer.Serialize(result, _options));
+            foreach (var obj in c.CurrentValue)
+                result.Add(GetEntryId(c.Metadata.TargetEntityType, obj));
+            return (name, JsonSerializer.Serialize(result, _options));
+        }))!;
+        return resultQuery;
     }
 }

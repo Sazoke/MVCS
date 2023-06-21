@@ -8,6 +8,8 @@ public class Version
     public Guid Id { get; set; } = Guid.NewGuid();
     
     public EntityState ChangeType { get; set; }
+    
+    public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
 
     [Column(TypeName = "jsonb")]
     public List<Change> Changes { get; set; } = new();
