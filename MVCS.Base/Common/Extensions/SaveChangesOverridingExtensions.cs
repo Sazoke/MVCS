@@ -12,22 +12,40 @@ namespace MVCS.Base.Common.Extensions;
 
 internal static  class SaveChangesOverridingExtensions
 {
-    private static JsonSerializerOptions _options = new()
+    private static readonly JsonSerializerOptions Options = new()
         { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+    
     public static void CommitChanges(this MVCSDbContext context)
-    { 
+    {
         var entries = context.ChangeTracker.Entries()
             .Where(e => e.State is EntityState.Added or EntityState.Modified or EntityState.Deleted)
             .Where(e => NeedVersion(e))
+            .Select(e => new EntryVersionState
+            {
+                Id = GetEntryId(e.Metadata, e.Entity),
+                Entry = e
+            })
             .ToArray();
-        var versions = entries.Select(e => e.State switch
+
+        var ids = entries.Select(e => e.Id).ToArray();
+        var previousVersions = context.Versions.Where(v => ids.Contains(v.ObjectId))
+            .GroupBy(v => v.ObjectId)
+            .ToDictionary(g => g.Key, g => g.ToArray());
+        foreach (var entry in entries)
+            if (previousVersions.TryGetValue(entry.Id, out var previous))
+            {
+                var previousVersion = previous.First(v => v.IsActual);
+                entry.PreviousVersion = previousVersion;
+                previousVersion.IsActual = false;
+            }
+        
+        var versions = entries.Select(e => e.Entry.State switch
             {
                 EntityState.Added => GetAddedVersion(e),
-                EntityState.Modified => GetModifiedVersion(context, e),
-                EntityState.Deleted => GetDeletedVersion(context, e),
+                EntityState.Modified => GetModifiedVersion(e),
+                EntityState.Deleted => GetDeletedVersion(e),
                 _ => null
-            })
-            .Where(v => v is not null)
+            }).Where(e => e is not null)
             .ToArray();
         context.Versions.AddRange(versions!);
     }
@@ -40,14 +58,13 @@ internal static  class SaveChangesOverridingExtensions
                type.GetProperties().Any(p => p.GetCustomAttribute(versionType) is not null);
     }
 
-    private static Version GetAddedVersion(EntityEntry entityEntry)
+    private static Version GetAddedVersion(EntryVersionState entry)
     {
-        var id = GetEntryId(entityEntry.Metadata, entityEntry.Entity);
-        var version = new Version()
+        var version = new Version
         {
-            ObjectId = id,
-            ChangeType = entityEntry.State,
-            Changes = GetCheckedProperties(entityEntry)
+            ObjectId = entry.Id,
+            ChangeType = entry.Entry.State,
+            Changes = GetCheckedProperties(entry.Entry)
                 .Where(p => p.JsonValue is not null)
                 .Select(p => new Change
                 {
@@ -59,33 +76,26 @@ internal static  class SaveChangesOverridingExtensions
         return version;
     }
     
-    private static Version GetDeletedVersion(MVCSDbContext context, EntityEntry entityEntry)
+    private static Version GetDeletedVersion(EntryVersionState entity)
     {
-        var id = GetEntryId(entityEntry.Metadata, entityEntry.Entity);
-        var previousVersion = context.Versions.First(v => v.IsActual && v.ObjectId == id);
-        previousVersion.IsActual = false;
-        var version = new Version()
+        var version = new Version
         {
-            ObjectId = id,
-            ChangeType = entityEntry.State,
-            PreviousVersion = previousVersion
+            ObjectId = entity.Id,
+            ChangeType = entity.Entry.State,
+            PreviousVersion = entity.PreviousVersion
         };
 
         return version;
     }
 
-    private static Version GetModifiedVersion(MVCSDbContext context, EntityEntry entityEntry)
+    private static Version GetModifiedVersion(EntryVersionState entity)
     {
-        var id = GetEntryId(entityEntry.Metadata, entityEntry.Entity);
-        var versions = context.Versions.Where(v => v.ObjectId == id).ToArray();
-        var previousVersion = versions.First(v => v.IsActual);
-        previousVersion.IsActual = false;
-        var props = GetNotModifiedProperties(previousVersion);
-        var version = new Version()
+        var props = GetNotModifiedProperties(entity.PreviousVersion!);
+        var version = new Version
         {
-            ObjectId = id,
-            ChangeType = entityEntry.State,
-            Changes = GetCheckedProperties(entityEntry)
+            ObjectId = entity.Id,
+            ChangeType = entity.Entry.State,
+            Changes = GetCheckedProperties(entity.Entry)
                 .Where(p => props.ContainsKey(p.Name) && p.JsonValue != props[p.Name] ||
                             !props.ContainsKey(p.Name) && p.JsonValue is not null)
                 .Select(p => new Change
@@ -93,7 +103,7 @@ internal static  class SaveChangesOverridingExtensions
                     PropertyName = p.Name,
                     Value = p.JsonValue
                 }).ToList(),
-            PreviousVersion = previousVersion
+            PreviousVersion = entity.PreviousVersion
         };
 
         return version;
@@ -132,15 +142,15 @@ internal static  class SaveChangesOverridingExtensions
 
         var resultQuery =
             query.Select(q =>
-                (q.Metadata.Name, q.CurrentValue is null ? null : JsonSerializer.Serialize(q.CurrentValue, _options)));
+                (q.Metadata.Name, q.CurrentValue is null ? null : JsonSerializer.Serialize(q.CurrentValue, Options)));
         resultQuery = resultQuery!.Concat(entry.Collections.Select(c =>
         {
             var name = c.Metadata.Name;
             var result = new List<string>();
-            if (c.CurrentValue is null) return (name, JsonSerializer.Serialize(result, _options));
+            if (c.CurrentValue is null) return (name, JsonSerializer.Serialize(result, Options));
             foreach (var obj in c.CurrentValue)
                 result.Add(GetEntryId(c.Metadata.TargetEntityType, obj));
-            return (name, JsonSerializer.Serialize(result, _options));
+            return (name, JsonSerializer.Serialize(result, Options));
         }))!;
         return resultQuery;
     }
